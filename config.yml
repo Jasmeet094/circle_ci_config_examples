@@ -1,0 +1,296 @@
+version: 2.1
+
+parameters:
+  sha:
+    type: string
+    default: " "
+
+orbs:
+  slack: circleci/slack@4.3.1
+  snyk: snyk/snyk@2.0.2
+
+slack-fail-post-step: &slack-fail-post-step
+  post-steps:
+    - slack/notify:
+        channel: C016PQHRC5P
+        custom: |
+          {
+            "text": ":x: Job '${CIRCLE_JOB}' failed for Project ${CIRCLE_PROJECT_REPONAME} on branch ${CIRCLE_BRANCH}."
+          }
+        event: fail
+
+jobs:
+
+  slack_notify_pass_ng_deployments:
+    docker:
+     - image: cimg/base:stable
+    steps:
+      - slack/notify:
+          channel: C05051LGXFV
+          event: pass
+          custom: |
+            {
+              "text": ":white_check_mark: The ${CIRCLE_PROJECT_REPONAME} project has been successfully deployed to the ${CIRCLE_BRANCH} environment."
+            }
+  slack_notify_success:
+    docker:
+     - image: cimg/base:stable
+    steps:
+      - slack/notify:
+          channel: C016PQHRC5P
+          event: pass
+          custom: |
+            {
+              "text": ":white_check_mark: The ${CIRCLE_PROJECT_REPONAME} project has been successfully deployed to the ${CIRCLE_BRANCH} environment."
+            }
+
+    
+
+  Notification_Api_Snyk: # Job to docker build and ecs deploy for Service finexio-ng-notifications-api-finexio-environment
+    docker:
+      - image: cimg/node:20.15.0
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - add_ssh_keys:
+          fingerprints:
+            - "e5:b4:ea:42:3d:f7:15:84:76:65:c4:58:e4:e5:34:02"
+      - run:
+          name: Install dependencies
+          command: |
+            sudo apt-get update && sudo apt-get install -y curl python3 python3-pip jq make git bash
+            pip3 install wheel && pip3 install "Cython<3.0" "pyyaml<6" --no-build-isolation && pip3 install awscli
+            pip3 install --upgrade awscli
+            pip3 install ecs-deploy==1.14.0
+      
+      - run:
+          name: Assume AWS Role
+          command: |
+            make aws-assume
+
+      - run:
+          name: Capture Current Task Definition ARN
+          command: |
+
+              CURRENT_API_TASK_DEFINITION=$(aws ecs describe-services --region $REGION --cluster $NG_CLUSTER --services $NG_FINEXIO_NOTIFICATION_API_SERVICE --query 'services[0].taskDefinition' --output text)
+              echo 'export CURRENT_API_TASK_DEFINITION="'$CURRENT_API_TASK_DEFINITION'"' >> $BASH_ENV
+              cat $BASH_ENV
+      
+      - run:
+         command: |
+           echo "The current task definition ARN is: ${CURRENT_API_TASK_DEFINITION}"
+
+      - run:
+          name: Docker build push and Deploy
+          command: |
+            make aws-assume
+            make Api-Notification-docker-build Dockerfile_Path=./Finexio.Api.Notifications/Dockerfile
+            make Api-Notification-deploy-service
+
+      - run:
+          name: Verify ECS Service Status
+          command: |
+            source $BASH_ENV
+            TIMEOUT=600 # 10 minutes
+            SLEEP_INTERVAL=10
+
+            start_time=$(date +%s)
+            elapsed=0
+
+            while [ "$elapsed" -lt "$TIMEOUT" ]; do
+              PRIMARY_DEPLOYMENT_STATUS=$(aws ecs describe-services --region $REGION --cluster $NG_CLUSTER --services $NG_FINEXIO_NOTIFICATION_API_SERVICE --query 'services[0].deployments[?status==`PRIMARY`].rolloutState' --output text)
+              echo "PRIMARY_DEPLOYMENT_STATUS: $PRIMARY_DEPLOYMENT_STATUS"
+
+              NEW_API_TASK_DEFINITION=$(aws ecs describe-services --region $REGION --cluster $NG_CLUSTER --services $NG_FINEXIO_NOTIFICATION_API_SERVICE --query 'services[0].taskDefinition' --output text)
+              echo "CURRENT_API_TASK_DEFINITION: $CURRENT_API_TASK_DEFINITION"
+              echo "NEW_API_TASK_DEFINITION: $NEW_API_TASK_DEFINITION"
+
+              if [ "$PRIMARY_DEPLOYMENT_STATUS" == "COMPLETED" ]; then
+                if [ "$NEW_API_TASK_DEFINITION" != "$CURRENT_API_TASK_DEFINITION" ]; then
+                  echo "ECS Service deployment completed successfully."
+                  exit 0
+                else
+                  echo "ECS Service deployment rolled back to the previous task definition."
+                  exit 1
+                fi
+              elif [ "$PRIMARY_DEPLOYMENT_STATUS" == "FAILED" ]; then
+                echo "ECS Service deployment failed. Exiting."
+                exit 1
+              fi
+
+              sleep $SLEEP_INTERVAL
+              current_time=$(date +%s)
+              elapsed=$((current_time - start_time))
+            done
+
+            echo "Timed out waiting for ECS Service deployment to complete."
+            exit 1            
+
+      - snyk/scan:
+          no-cache: true
+          cli-version: '1.1292.1'
+          token-variable: SNYK_TOKEN
+          docker-image-name: ${AWS_ECR_ACCOUNT_URL}/finexio-ng-notifications-api:latest
+          fail-on-issues: false
+          monitor-on-build: true
+          severity-threshold: high
+          target-file: ./Finexio.Api.Notifications/Dockerfile
+          project: finexio-ng-notifications-api-finexio-"<<pipeline.git.branch>>"
+          
+      - run:
+          name: Update SSM Parameter
+          shell: /bin/bash
+          command:  |
+            make Api-Notification-update-commit-id-ssm-parameter
+
+
+ 
+
+workflows:
+  version: 2
+  build_and_deploy_dev:
+    jobs:
+      - Notification_Api: # ECS Service
+          name: "Notification_Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Services_Api:
+          name: "Services_Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Admin_Api:
+          name: "Admin_Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Portal_Api:
+          name: "Portal_Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Api:
+          name: "Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - JPM_Mock_Api:
+          name: "JPM_Mock_Api_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Notification_Aws: # lambda
+          name: "Notification_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Ingestion_Aws:
+          name: "Ingestion_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Funding_Aws:
+          name: "Funding_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Enrichment_Aws:
+          name: "Enrichment_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - CardReloads_Aws:
+          name: "CardReloads_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Disbursement_Aws:
+          name: "Disbursement_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Reconciliation_Aws:
+          name: "Reconciliation_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Sequencing_Aws:
+          name: "Sequencing_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Compliance_Aws:
+          name: "Compliance_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Correction_Aws:
+          name: "Correction_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - Webhooks_Aws:
+          name: "Webhooks_Aws_dev"
+          filters:
+            branches:
+              only: develop
+          context: ng-dev
+          <<: *slack-fail-post-step
+      - slack_notify_success:
+          requires:
+            - Notification_Api_dev
+            - Services_Api_dev
+            - Admin_Api_dev
+            - Portal_Api_dev
+            - Api_dev
+            - JPM_Mock_Api_dev
+            - Notification_Aws_dev
+            - Ingestion_Aws_dev
+            - Funding_Aws_dev
+            - Enrichment_Aws_dev
+            - CardReloads_Aws_dev
+            - Disbursement_Aws_dev
+            - Reconciliation_Aws_dev
+            - Sequencing_Aws_dev
+            - Compliance_Aws_dev
+            - Correction_Aws_dev
+            - Webhooks_Aws_dev
+          filters:
+            branches:
+              only: develop
+
+  
